@@ -366,6 +366,48 @@ def retry_lead_run(run_id: UUID):
         raise HTTPException(409, str(error)) from error
 
 
+class LeadStatusIn(BaseModel):
+    record_id: str | None = None
+    company: str | None = None
+    source_url: str | None = None
+    status: str
+    date: str
+    channel: str
+    to_address: str = ""
+    from_address: str = ""
+    subject: str = ""
+    note: str = ""
+
+
+@app.post("/api/leads/status", dependencies=write)
+def update_lead_status(body: LeadStatusIn):
+    try:
+        return LeadStore(DB_PATH).update_status(**body.model_dump())
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    except KeyError:
+        raise HTTPException(404, "リードが見つかりません") from None
+
+
+@app.get("/api/leads/contact-log")
+def company_contact_log(company: str | None = None):
+    return _contact_log(company=company)
+
+
+@app.get("/api/leads/{lead_id}/contact-log")
+def lead_contact_log(lead_id: str):
+    return _contact_log(lead_id=lead_id)
+
+
+def _contact_log(**identifier):
+    try:
+        return LeadStore(DB_PATH).contact_log(**identifier)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    except KeyError:
+        raise HTTPException(404, "リードが見つかりません") from None
+
+
 if __name__ == "__main__":
     import uvicorn
 
