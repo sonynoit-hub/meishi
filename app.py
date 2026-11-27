@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, field_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from codex_reader import ReadError, recognize
-from lead_store import LeadStore
+from lead_store import LeadStore, SuppressedLeadError
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("MEISHI_DB", ROOT / "data" / "meishi.sqlite3"))
@@ -366,7 +366,20 @@ def retry_lead_run(run_id: UUID):
         raise HTTPException(409, str(error)) from error
 
 
-class LeadStatusIn(BaseModel):
+class LeadUpdateIn(BaseModel):
+    email: str | None = None
+    email_source_url: str | None = None
+    email_checked_at: str | None = None
+    email_evidence: str | None = None
+    do_not_contact: bool = False
+    sequence_step: int = 0
+    next_followup_at: str | None = None
+    segment: str | None = None
+    batch_id: str | None = None
+    tags: str | None = None
+
+
+class LeadStatusIn(LeadUpdateIn):
     record_id: str | None = None
     company: str | None = None
     source_url: str | None = None
@@ -382,11 +395,88 @@ class LeadStatusIn(BaseModel):
 @app.post("/api/leads/status", dependencies=write)
 def update_lead_status(body: LeadStatusIn):
     try:
-        return LeadStore(DB_PATH).update_status(**body.model_dump())
+        return LeadStore(DB_PATH).update_status(**body.model_dump(exclude_unset=True))
+    except SuppressedLeadError as error:
+        raise HTTPException(409, str(error)) from error
     except ValueError as error:
         raise HTTPException(400, str(error)) from error
     except KeyError:
         raise HTTPException(404, "リードが見つかりません") from None
+
+
+@app.patch("/api/leads/{lead_id}", dependencies=write)
+def update_lead(lead_id: str, body: LeadUpdateIn):
+    try:
+        return LeadStore(DB_PATH).update_lead(lead_id, **body.model_dump(exclude_unset=True))
+    except SuppressedLeadError as error:
+        raise HTTPException(409, str(error)) from error
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    except KeyError:
+        raise HTTPException(404, "リードが見つかりません") from None
+
+
+def lead_filters(status: str | None = None, segment: str | None = None,
+                 batch_id: str | None = None, due_on_or_before: str | None = None,
+                 include_suppressed: bool = False, limit: int | None = None, offset: int = 0):
+    return dict(status=status, segment=segment, batch_id=batch_id, due_on_or_before=due_on_or_before,
+                include_suppressed=include_suppressed, limit=limit, offset=offset)
+
+
+@app.get("/api/leads")
+def list_leads(filters: Annotated[dict, Depends(lead_filters)]):
+    try:
+        return LeadStore(DB_PATH).list_leads(**filters)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@app.get("/api/leads/export.csv")
+def export_leads_csv(filters: Annotated[dict, Depends(lead_filters)]):
+    try:
+        content = LeadStore(DB_PATH).export_leads_csv(**filters)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    return Response(content, media_type="text/csv", headers={
+        "Content-Disposition": 'attachment; filename="leads.csv"',
+    })
+
+
+class SuppressionIn(BaseModel):
+    kind: Literal["email", "domain"]
+    value: str
+    reason: str
+    note: str = ""
+    source: str = ""
+
+
+@app.get("/api/suppressions")
+def list_suppressions(include_removed: bool = False):
+    return LeadStore(DB_PATH).list_suppressions(include_removed=include_removed)
+
+
+@app.post("/api/suppressions", dependencies=write)
+def add_suppression(body: SuppressionIn):
+    try:
+        return LeadStore(DB_PATH).add_suppression(**body.model_dump())
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@app.delete("/api/suppressions/{suppression_id}", dependencies=write)
+def remove_suppression(suppression_id: str):
+    try:
+        return LeadStore(DB_PATH).remove_suppression(suppression_id)
+    except KeyError:
+        raise HTTPException(404, "抑止リストの項目が見つかりません") from None
+
+
+@app.get("/api/suppressions/check")
+def check_suppression(address: str):
+    try:
+        return {"suppressed": LeadStore(DB_PATH).is_suppressed(address)}
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
 
 
 @app.get("/api/leads/contact-log")
