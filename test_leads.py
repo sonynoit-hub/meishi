@@ -59,10 +59,10 @@ class NamesAndUrls(unittest.TestCase):
             canonical_url("https://example.com/partner?id=1"),
             canonical_url("https://example.com/partner?id=2"),
         )
-        self.assertEqual(
+        self.assertNotEqual(
             canonical_url("https://example.com/partner?b=2&a=1"),
             canonical_url("https://example.com/partner?a=1&b=2"),
-        )
+        )  # query order can be meaningful, so it is preserved
         self.assertEqual(canonical_url("https://日本.jp/a"), "https://xn--wgv71a.jp/a")
 
     def test_company_legal_forms_and_width(self):
@@ -491,6 +491,190 @@ class CleanupPlan(unittest.TestCase):
         self.assertEqual(reviewed.returncode, 0, reviewed.stderr)
         self.assertIn("ページは2件とも残す", reviewed.stdout)
         self.assertEqual(self._counts(), (2, 3, 3))
+
+
+class LeadRegressionTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(temporary.cleanup)
+        self.path = Path(temporary.name) / "leads.sqlite3"
+        self.store = LeadStore(self.path, fetcher=ok_fetch)
+
+    def test_url_preserves_meaningful_escapes_query_and_ports(self):
+        key = canonical_url
+        self.assertEqual(
+            key("https://example.com/%7e/a%2fb?ref=&x=%2f&x=&UTM_custom=1&gclid=2"),
+            "https://example.com/~/a%2Fb?ref=&x=%2F&x=",
+        )
+        self.assertNotEqual(key("https://example.com/a%2fb"), key("https://example.com/a/b"))
+        self.assertNotEqual(key("https://example.com/?a=1&b=2"), key("https://example.com/?b=2&a=1"))
+        self.assertNotEqual(key("https://example.com/?ref="), key("https://example.com/"))
+        self.assertEqual(key("http://example.com:80/"), key("https://example.com:443/"))
+        for url in ("http://example.com:443/", "https://example.com:80/"):
+            self.assertNotEqual(key(url), key("https://example.com/"))
+            self.assertEqual(key(key(url)), key(url))
+
+    def test_redirect_alias_reuses_lead_and_conflicts_are_planned(self):
+        self.store.ensure_schema()
+        target = "https://example.com/target"
+        first_url = "https://example.com/first"
+        second_url = "https://example.com/second"
+        self.store.fetcher = lambda url: ok_fetch(target)
+        first = self.store.submit("First", first_url, SIGNAL, "partner")
+        self.assertEqual(self.store.submit("First", target, SIGNAL, "partner")["run_id"], first["run_id"])
+        second = self.store.submit("Second", second_url, SIGNAL, "partner")
+        self.assertNotEqual(first["lead_id"], second["lead_id"])
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM leads").fetchone()[0], 2)
+        merge, = self.store.plan(read_only=True).url_merges
+        self.assertEqual({merge.keep_lead_id, *merge.drop_lead_ids}, {first["lead_id"], second["lead_id"]})
+        self.assertIn(target, merge.aliases)
+        self.store.apply()
+        for url in (first_url, second_url, target):
+            self.assertEqual(self.store.submit("First", url, SIGNAL, "partner")["lead_id"], merge.keep_lead_id)
+
+    def test_redirect_to_an_existing_primary_url_is_planned(self):
+        self.store.ensure_schema()
+        target = "https://example.com/target"
+        first = self.store.submit("Example", target, SIGNAL, "partner")
+        self.store.fetcher = lambda url: ok_fetch(target)
+        second = self.store.submit("Example", "https://example.com/redirect", SIGNAL, "partner")
+        self.assertNotEqual(first["lead_id"], second["lead_id"])
+        merge, = self.store.plan(read_only=True).url_merges
+        self.assertEqual({merge.keep_lead_id, *merge.drop_lead_ids}, {first["lead_id"], second["lead_id"]})
+        self.assertEqual(self.store.submit("Example", target, SIGNAL, "partner")["lead_id"], first["lead_id"])
+
+    def test_resubmissions_preserve_original_metadata_and_every_attempt(self):
+        import json
+
+        self.store.ensure_schema()
+        url = "https://example.com/a"
+        first = self.store.submit("Original", url, SIGNAL, "partner")
+        for company in ("Second", "Third"):
+            reused = self.store.submit(company, url, "New signal", "buyer")
+            self.assertEqual(reused["run_id"], first["run_id"])
+            self.assertEqual(set(reused["differing_fields"]), {"company", "signal", "lead_type"})
+        with sqlite3.connect(self.path) as db:
+            original = db.execute("SELECT company_name, signal, lead_type FROM leads").fetchone()
+            self.assertEqual(original, ("Original", SIGNAL, "partner"))
+            run = db.execute("""
+                SELECT submitted_company, submitted_signal, submitted_lead_type, resubmissions FROM runs
+            """).fetchone()
+            self.assertEqual(run[:3], original)
+            history = json.loads(run[3])
+            self.assertEqual([(entry["company"], entry["signal"], entry["lead_type"]) for entry in history],
+                             [("Second", "New signal", "buyer"), ("Third", "New signal", "buyer")])
+            db.execute("UPDATE runs SET processing_status = 'fetch_error'")
+        retried = self.store.submit("Fourth", url, "Retry signal", "buyer")
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute("""
+                SELECT submitted_company, submitted_signal, submitted_lead_type FROM runs WHERE id = ?
+            """, (retried["run_id"],)).fetchone(), ("Fourth", "Retry signal", "buyer"))
+            self.assertEqual(db.execute("SELECT company_name, signal, lead_type FROM leads").fetchone(), original)
+
+    def test_legacy_columns_backfill_and_unique_indexes_after_cleanup(self):
+        with sqlite3.connect(self.path) as db:
+            db.executescript("""
+                CREATE TABLE companies (id TEXT PRIMARY KEY, name TEXT, created_at TEXT, updated_at TEXT);
+                CREATE TABLE leads (
+                    id TEXT PRIMARY KEY, company_id TEXT, company_name TEXT, source_url TEXT,
+                    signal TEXT, lead_type TEXT, status TEXT, created_at TEXT, updated_at TEXT
+                );
+                CREATE TABLE runs (id TEXT PRIMARY KEY, lead_id TEXT, source_url TEXT,
+                    processing_status TEXT, submitted_at TEXT);
+                INSERT INTO companies VALUES ('c1', 'Example Inc.', '1', '1'), ('c2', 'Example', '2', '2');
+                INSERT INTO leads VALUES
+                    ('l1','c1','Example Inc.','http://www.example.com/a/','old','buyer','new','1','1'),
+                    ('l2','c2','Example','https://example.com/a','new','partner','new','2','2');
+                INSERT INTO runs VALUES ('r1','l1','http://www.example.com/a/','review','1');
+            """)
+        with self.assertLogs("lead_store", level="WARNING"):
+            warnings = self.store.ensure_schema()
+        self.assertEqual(len(warnings), 2)
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT canonical_url, fetch_url FROM runs").fetchone(),
+                             ("https://example.com/a", "http://www.example.com/a/"))
+            self.assertEqual(db.execute("SELECT latest_run_id FROM leads WHERE id = 'l1'").fetchone(), ("r1",))
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM leads").fetchone()[0], 2)
+        self.store.apply()
+        self.assertEqual(self.store.ensure_schema(), [])
+        with sqlite3.connect(self.path) as db:
+            for table in ("companies", "leads"):
+                self.assertTrue(any(row[2] and row[3] == "c" for row in db.execute(f"PRAGMA index_list({table})")))
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM leads").fetchone()[0], 1)
+
+    def test_backfill_recovers_legacy_url_from_the_initial_fetch(self):
+        self.store.ensure_schema()
+        original = "http://example.com:443/a%2fb?ref=&b=2&a=1"
+        created = self.store.submit("Example", original, SIGNAL, "partner")
+        legacy = "https://example.com/a/b?a=1&b=2"
+        with sqlite3.connect(self.path) as db:
+            for table in ("leads", "runs"):
+                db.execute(f"UPDATE {table} SET source_url = ?, canonical_url = ?", (legacy, legacy))
+        self.assertEqual(self.store.ensure_schema(), [])
+        self.assertEqual(self.store.ensure_schema(), [])
+        reused = self.store.submit("Example", original, SIGNAL, "partner")
+        self.assertEqual(reused["run_id"], created["run_id"])
+        distinct = self.store.submit("Example", legacy, SIGNAL, "partner")
+        self.assertNotEqual(distinct["lead_id"], created["lead_id"])
+
+    def test_apply_replans_under_write_lock_and_preserves_moved_urls(self):
+        from unittest.mock import patch
+
+        import lead_store
+
+        self.store.ensure_schema()
+        first = self.store.submit("Example", "https://example.com/a", SIGNAL, "partner")
+        stale = self.store.plan(read_only=True)
+        self.assertTrue(stale.empty)
+        self.store.fetcher = lambda url: ok_fetch("https://example.com/a")
+        second = self.store.submit("Example", "https://example.com/b?ref=", SIGNAL, "partner")
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE runs SET processing_status = 'added' WHERE id = ?", (first["run_id"],))
+
+        build_plan = lead_store._build_plan
+
+        def check_lock(db):
+            with sqlite3.connect(self.path, timeout=0) as other:
+                with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                    other.execute("BEGIN IMMEDIATE")
+            return build_plan(db)
+
+        with patch.object(lead_store, "_build_plan", side_effect=check_lock):
+            applied = self.store.apply(stale)
+        self.assertEqual(len(applied.url_merges), 1)
+        with sqlite3.connect(self.path) as db:
+            run = db.execute("""
+                SELECT lead_id, original_source_url, original_canonical_url, original_fetch_url
+                FROM runs WHERE id = ?
+            """, (second["run_id"],)).fetchone()
+        self.assertEqual(run, (first["lead_id"], *("https://example.com/b?ref=",) * 3))
+
+    def test_latest_run_uses_timestamp_then_id_across_cleanup_submit_and_retry(self):
+        self.store.ensure_schema()
+        first = self.store.submit("Example", "https://example.com/a", SIGNAL, "partner")
+        self.store.fetcher = lambda url: ok_fetch("https://example.com/a")
+        second = self.store.submit("Example", "https://example.com/b", SIGNAL, "partner")
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE runs SET id = 'z', submitted_at = '2000', processing_status = 'review' WHERE id = ?",
+                       (first["run_id"],))
+            db.execute("UPDATE runs SET id = 'a', submitted_at = '2000', processing_status = 'added' WHERE id = ?",
+                       (second["run_id"],))
+        plan = self.store.plan(read_only=True)
+        self.assertEqual(plan.url_merges[0].latest_run_id, "z")
+        self.store.apply(plan)
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT latest_run_id FROM leads").fetchone(), ("z",))
+        self.assertEqual(self.store.submit("Example", "https://example.com/a", SIGNAL, "partner")["run_id"], "z")
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE runs SET processing_status = 'fetch_error' WHERE id = 'z'")
+        with self.assertRaises(ValueError):
+            self.store.retry("a")
+        retried = self.store.retry("z")
+        reused = self.store.submit("Example", "https://example.com/a", SIGNAL, "partner")
+        self.assertEqual(reused["run_id"], retried["run_id"])
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute("SELECT latest_run_id FROM leads").fetchone(), (retried["run_id"],))
 
 
 if __name__ == "__main__":

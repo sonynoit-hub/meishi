@@ -44,11 +44,50 @@ sqlite3 data/meishi.sqlite3 ".backup 'data/meishi-backup.sqlite3'"
 
 To check a backup without touching your current data, set `MEISHI_DB=/absolute/path/to/backup.sqlite3` and `MEISHI_PORT=8001` when launching a separate instance. Use a copy of the backup if you intend to edit it.
 
+## Submit and clean up local leads
+
+Send `company`, `source_url`, `signal`, and `lead_type` (`buyer` or `partner`)
+to `POST /api/leads` with the `X-Meishi: 1` header. The newest run is
+selected by `submitted_at`, with the greatest run ID breaking ties. A
+processing or successful run is reused. If the newest run failed, submitting
+again or calling `POST /api/leads/runs/{run_id}/retry` for that run starts a
+new attempt.
+
+The canonical URL folds host case, a leading `www.`, HTTP and HTTPS, fragments,
+and trailing slashes. Paths retain their case and use dot-segment normalization.
+Percent escapes use uppercase hex, and only escapes for unreserved characters
+are decoded. Query parameters keep their order, repeats, blank values, and
+`ref`. The tracking keys removed are `utm_*`, `gclid`, `fbclid`, `yclid`,
+`mc_cid`, and `mc_eid`. Port 80 is the HTTP default and port 443 is the HTTPS
+default. An explicit HTTP port 443 keeps the HTTP scheme in the key so that
+canonicalizing the key again preserves its port.
+
+Successful redirects register their final URL for future submissions. If that
+URL already belongs to another lead, the run records the redirect for cleanup.
+The lead keeps its original company, signal, and lead type. Each run records
+the fields that started it and stores reused submissions in its
+`resubmissions` history. The submit response lists changed fields in
+`differing_fields`.
+
+On startup, the app adds missing columns and backfills keys. Duplicate keys
+that block uniqueness produce a warning. To review duplicates and redirect
+relationships in a local SQLite database, run:
+
+```sh
+python3 scripts/dedup_leads.py --db data/meishi.sqlite3
+```
+
+Add `--apply` to compute and apply a fresh plan in one write transaction.
+Merged leads retain their URLs as aliases, and moved runs keep their original
+source, canonical, and fetch URLs. Contact history moves to the surviving
+lead, which keeps one entry per date, channel, and recipient. Apply also retries key backfill and index
+creation after the merges.
+
 ## Lead status and contact history
 
 Record outreach with `POST /api/leads/status`. Use a lead or run ID in
 `record_id`, a `source_url`, or a `company` name. Matching uses the ID
-first, then the canonical URL, then the normalized company name. A company
+first, then the canonical URL and its aliases, then the normalized company name. A company
 with multiple leads resolves to its oldest lead by name. Supply an ID or URL
 to target a particular page.
 
