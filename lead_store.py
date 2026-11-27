@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import io
 import ipaddress
 import json
 import logging
@@ -37,6 +38,7 @@ import urllib.request
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from datetime import date as calendar_date, datetime, timezone
+from itertools import islice
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
@@ -48,8 +50,29 @@ BROWSER_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 MAX_BODY_BYTES = 3 * 1024 * 1024
-LEAD_STATUSES = ("new", "contacted", "replied", "meeting", "won", "lost")
+LEAD_STATUSES = ("new", "contacted", "replied", "meeting", "won", "lost", "bounced", "unsubscribed")
 LEAD_STATUS_COLUMN = f"TEXT NOT NULL DEFAULT 'new' CHECK ({{column}} IN {LEAD_STATUSES})"
+AUTO_SUPPRESSION = {"bounced", "unsubscribed"}
+OUTCOME_STATUSES = {"replied", "won", "lost"} | AUTO_SUPPRESSION
+STOP_FOLLOWUP = OUTCOME_STATUSES | {"meeting"}
+CRM_COLUMNS = {
+    "email": "TEXT",
+    "email_source_url": "TEXT",
+    "email_checked_at": "TEXT",
+    "email_evidence": "TEXT",
+    "do_not_contact": "INTEGER NOT NULL DEFAULT 0",
+    "sequence_step": "INTEGER NOT NULL DEFAULT 0",
+    "next_followup_at": "TEXT",
+    "segment": "TEXT",
+    "batch_id": "TEXT",
+    "tags": "TEXT",
+}
+LEAD_CSV_COLUMNS = (
+    "id", "company_id", "company_name", "company", "source_url", "canonical_url",
+    "signal", "lead_type", "status", *CRM_COLUMNS, "suppressed", "last_contacted_at",
+    "last_contact_status", "last_contact_channel", "last_contact_to_address",
+    "last_contact_subject", "last_contact_note",
+)
 RUN_STATUSES = ("processing", "review", "added", "fetch_error")
 STATUS_RANK = {"added": 4, "review": 3, "processing": 2, "fetch_error": 1}
 TRANSIENT_HTTP = {408, 429, 500, 502, 503, 504}
@@ -119,6 +142,17 @@ CREATE TABLE IF NOT EXISTS contact_logs (
     created_at TEXT NOT NULL,
     UNIQUE (lead_id, contacted_on, channel, to_address)
 );
+CREATE TABLE IF NOT EXISTS suppressions (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('email', 'domain')),
+    value TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    note TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    source TEXT NOT NULL,
+    removed_at TEXT,
+    UNIQUE (kind, value)
+);
 CREATE TABLE IF NOT EXISTS lead_aliases (
     canonical_url TEXT PRIMARY KEY,
     lead_id TEXT NOT NULL REFERENCES leads(id)
@@ -134,7 +168,9 @@ ADDITIVE_COLUMNS = {
         "last_contacted_at": "TEXT",
         "created_via": "TEXT NOT NULL DEFAULT 'submit' CHECK (created_via IN ('submit', 'status_update'))",
         "latest_run_id": "TEXT",
+        **CRM_COLUMNS,
     },
+    "contact_logs": {"sequence_step": "INTEGER NOT NULL DEFAULT 0", "batch_id": "TEXT"},
     "runs": {
         "canonical_url": "TEXT",
         "fetch_url": "TEXT",
@@ -176,6 +212,88 @@ class _BlockedURL(Exception):
 
 def _now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+class SuppressedLeadError(ValueError):
+    pass
+
+
+def _domain(value):
+    try:
+        domain = value.strip().rstrip(".").encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        raise ValueError("ドメインを確認してください") from None
+    if not all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+               for label in domain.split(".")):
+        raise ValueError("ドメインを確認してください")
+    return domain
+
+
+def _email(value):
+    if not isinstance(value, str):
+        raise ValueError("メールアドレスを確認してください")
+    local, separator, domain = value.strip().partition("@")
+    if (not separator or not re.fullmatch(r"[^\s@<>(),;:\\]+", local)
+            or re.search(r"\s", domain) or "." not in domain.rstrip(".")):
+        raise ValueError("メールアドレスを確認してください")
+    return f"{local}@{_domain(domain)}"
+
+
+def _iso_date(value, field):
+    try:
+        if calendar_date.fromisoformat(value).isoformat() == value:
+            return value
+    except (TypeError, ValueError):
+        pass
+    raise ValueError(f"{field} は YYYY-MM-DD 形式です")
+
+
+def _crm_updates(fields):
+    for key, value in fields.items():
+        if key not in CRM_COLUMNS:
+            raise ValueError(f"不明なフィールド: {key}")
+        if key == "sequence_step":
+            if type(value) is not int or value < 0 or value > 2**63 - 1:
+                raise ValueError("sequence_step は0以上の整数です")
+        elif key == "do_not_contact":
+            if type(value) is not bool:
+                raise ValueError("do_not_contact は真偽値です")
+        elif value is not None and not isinstance(value, str):
+            raise ValueError(f"{key} は文字列です")
+    if "email" in fields:
+        fields["email"] = _email(fields["email"]) if fields["email"] is not None else None
+    if fields.get("next_followup_at") is not None:
+        _iso_date(fields["next_followup_at"], "next_followup_at")
+    return fields
+
+
+def _suppression_keys(address):
+    if not address:
+        return []
+    try:
+        normalized = _email(address).lower()
+    except ValueError:
+        return []
+    labels = normalized.split("@", 1)[1].split(".")
+    return [("email", normalized), *(
+        ("domain", ".".join(labels[index:])) for index in range(len(labels))
+    )]
+
+
+def _active_suppressions(db):
+    return {tuple(row) for row in db.execute(
+        "SELECT kind, value FROM suppressions WHERE removed_at IS NULL"
+    )}
+
+
+def _add_suppression(db, kind, value, reason, note, source):
+    return dict(db.execute("""
+        INSERT INTO suppressions (id, kind, value, reason, note, created_at, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (kind, value) DO UPDATE SET reason = excluded.reason,
+            note = excluded.note, source = excluded.source, removed_at = NULL
+        RETURNING *
+    """, (str(uuid4()), kind, value, reason, note, _now(), source)).fetchone())
 
 
 def canonical_url(value):
@@ -489,6 +607,51 @@ class DatabasePlan:
         return not self.url_merges and not self.company_merges and not self.empty_company_ids
 
 
+def _guard_outreach(db, lead, fields, address="", status=None):
+    if status in OUTCOME_STATUSES:
+        return
+    if status != "contacted" and fields.get("next_followup_at") is None and "sequence_step" not in fields:
+        return
+    if lead["do_not_contact"] or fields.get("do_not_contact"):
+        raise SuppressedLeadError("このリードは連絡禁止です")
+    keys = (_suppression_keys(address) + _suppression_keys(lead["email"])
+            + _suppression_keys(fields.get("email")))
+    if not address:
+        keys += _suppression_keys(_last_recipient(db, lead["id"]))
+    if _active_suppressions(db).intersection(keys):
+        raise SuppressedLeadError("この宛先は抑止リストに登録されています")
+
+
+def _update_lead_fields(db, lead_id, fields):
+    db.execute(
+        f"UPDATE leads SET {', '.join(f'{column} = ?' for column in fields)} WHERE id = ?",
+        (*fields.values(), lead_id),
+    )
+
+
+def _last_contact(db, lead_id):
+    return db.execute("""
+        SELECT * FROM contact_logs WHERE lead_id = ?
+        ORDER BY contacted_on DESC, created_at DESC, id DESC LIMIT 1
+    """, (lead_id,)).fetchone()
+
+
+def _last_recipient(db, lead_id):
+    row = db.execute("""
+        SELECT to_address FROM contact_logs
+        WHERE lead_id = ? AND instr(to_address, '@') > 0
+        ORDER BY contacted_on DESC, created_at DESC, id DESC LIMIT 1
+    """, (lead_id,)).fetchone()
+    return row["to_address"] if row else None
+
+
+def _contact_result(row, status_column):
+    result = dict(row)
+    result["status"] = result.pop(status_column)
+    result.pop("contact_status", None)
+    return result
+
+
 class LeadStore:
     def __init__(self, db_path, fetcher=None):
         self.db_path = Path(db_path)
@@ -525,14 +688,11 @@ class LeadStore:
             return _backfill_keys(db)
 
     def update_status(self, record_id=None, company=None, source_url=None, *,
-                      status, date, channel, to_address="", from_address="", subject="", note=""):
+                      status, date, channel, to_address="", from_address="", subject="", note="", **fields):
         if status not in LEAD_STATUSES:
             raise ValueError("status を確認してください")
-        try:
-            if calendar_date.fromisoformat(date).isoformat() != date:
-                raise ValueError
-        except (TypeError, ValueError):
-            raise ValueError("date は YYYY-MM-DD 形式です") from None
+        date = _iso_date(date, "date")
+        fields = _crm_updates(fields)
         channel = channel.strip().lower()
         if not channel:
             raise ValueError("channel を指定してください")
@@ -574,26 +734,134 @@ class LeadStore:
             else:
                 lead_id, company = lead["id"], lead["company_name"]
 
+            if created:
+                lead = db.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone()
+            _guard_outreach(db, lead, fields, to_address, status)
+            if status in STOP_FOLLOWUP:
+                fields["next_followup_at"] = None
+            if status in AUTO_SUPPRESSION:
+                keys = (_suppression_keys(to_address) or _suppression_keys(fields.get("email"))
+                        or _suppression_keys(lead["email"]))
+                if not keys:
+                    keys = _suppression_keys(_last_recipient(db, lead_id))
+                if keys:
+                    _add_suppression(db, "email", keys[0][1], status, note, "status_update")
+
             log_id = str(uuid4())
             key = (lead_id, date, channel, to_address)
-            db.execute("""
+            log_status_column = _lead_status_column(db, "contact_logs")
+            db.execute(f"""
                 INSERT INTO contact_logs (id, lead_id, contacted_on, channel, to_address,
-                    status, from_address, subject, note, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    {log_status_column}, from_address, subject, note, created_at, sequence_step, batch_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (lead_id, contacted_on, channel, to_address) DO NOTHING
-            """, (log_id, *key, status, from_address, subject, note, now))
+            """, (log_id, *key, status, from_address, subject, note, now,
+                  fields.get("sequence_step", lead["sequence_step"]), fields.get("batch_id", lead["batch_id"])))
             entry = db.execute("""
                 SELECT * FROM contact_logs WHERE lead_id = ? AND contacted_on = ?
                     AND channel = ? AND to_address = ?
             """, key).fetchone()
             status_column = _lead_status_column(db)
-            db.execute(f"""
-                UPDATE leads SET {status_column} = ?, updated_at = ?,
-                    last_contacted_at = MAX(COALESCE(last_contacted_at, ''), ?)
-                WHERE id = ? AND ({status_column} != ? OR last_contacted_at IS NULL OR last_contacted_at < ?)
-            """, (status, now, date, lead_id, status, date))
+            last_contacted = max(lead["last_contacted_at"] or "", date)
+            if fields or lead[status_column] != status or lead["last_contacted_at"] != last_contacted:
+                _update_lead_fields(db, lead_id, dict(fields, **{
+                    status_column: status, "updated_at": now, "last_contacted_at": last_contacted,
+                }))
             return {"lead_id": lead_id, "company": company, "status": status, "created": created,
-                    "log": dict(entry), "deduped": entry["id"] != log_id}
+                    "log": _contact_result(entry, log_status_column), "deduped": entry["id"] != log_id}
+
+    def update_lead(self, lead_id, **fields):
+        fields = _crm_updates(fields)
+        with self._transaction() as db:
+            lead = db.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone()
+            if lead is None:
+                raise KeyError(lead_id)
+            _guard_outreach(db, lead, fields)
+            if fields:
+                _update_lead_fields(db, lead_id, dict(fields, updated_at=_now()))
+            return self._lead_result(db, lead_id, _active_suppressions(db))
+
+    def add_suppression(self, kind, value, reason, note="", source=""):
+        if not isinstance(value, str):
+            raise ValueError("value を確認してください")
+        if kind == "email":
+            value = _email(value).lower()
+        elif kind == "domain":
+            value = _domain(value)
+        else:
+            raise ValueError("kind は email か domain です")
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("reason を指定してください")
+        with self._transaction() as db:
+            return _add_suppression(db, kind, value, reason, note, source)
+
+    def list_suppressions(self, include_removed=False):
+        with closing(self._connect()) as db:
+            return [dict(row) for row in db.execute("""
+                SELECT * FROM suppressions WHERE removed_at IS NULL OR ?
+                ORDER BY created_at DESC, id
+            """, (include_removed,))]
+
+    def remove_suppression(self, suppression_id):
+        with self._transaction() as db:
+            row = db.execute("""
+                UPDATE suppressions SET removed_at = COALESCE(removed_at, ?) WHERE id = ?
+                RETURNING *
+            """, (_now(), suppression_id)).fetchone()
+            if row is None:
+                raise KeyError(suppression_id)
+            return dict(row)
+
+    def is_suppressed(self, address):
+        keys = _suppression_keys(_email(address))
+        with closing(self._connect()) as db:
+            return bool(_active_suppressions(db).intersection(keys))
+
+    def _lead_result(self, db, lead_id, suppressions):
+        row = db.execute("""
+            SELECT leads.*, COALESCE(companies.name, leads.company_name) AS company
+            FROM leads LEFT JOIN companies ON companies.id = leads.company_id WHERE leads.id = ?
+        """, (lead_id,)).fetchone()
+        result = _contact_result(row, _lead_status_column(db))
+        result["do_not_contact"] = bool(result["do_not_contact"])
+        last = _last_contact(db, lead_id)
+        result["last_contact"] = _contact_result(last, _lead_status_column(db, "contact_logs")) if last else None
+        result["suppressed"] = result["do_not_contact"] or bool(suppressions.intersection(
+            _suppression_keys(result["email"]) + _suppression_keys(_last_recipient(db, lead_id))
+        ))
+        return result
+
+    def list_leads(self, *, status=None, segment=None, batch_id=None, due_on_or_before=None,
+                   include_suppressed=False, limit=None, offset=0):
+        if status is not None and status not in LEAD_STATUSES:
+            raise ValueError("status を確認してください")
+        if offset < 0 or (limit is not None and limit < 0):
+            raise ValueError("limit と offset は 0 以上です")
+        if due_on_or_before is not None:
+            _iso_date(due_on_or_before, "due_on_or_before")
+        with closing(self._connect()) as db:
+            db.execute("BEGIN")
+            filters = ((_lead_status_column(db), "=", status), ("segment", "=", segment),
+                       ("batch_id", "=", batch_id), ("next_followup_at", "<=", due_on_or_before))
+            conditions = [f"{column} {operator} ?" for column, operator, value in filters if value is not None]
+            where = " AND ".join(conditions) or "1"
+            ids = db.execute(f"SELECT id FROM leads WHERE {where} ORDER BY created_at, id",
+                             [value for _, _, value in filters if value is not None])
+            suppressions = _active_suppressions(db)
+            leads = (self._lead_result(db, row["id"], suppressions) for row in ids)
+            visible = (lead for lead in leads if include_suppressed or not lead["suppressed"])
+            return list(islice(visible, offset, None if limit is None else offset + limit))
+
+    def export_leads_csv(self, **filters):
+        output = io.StringIO(newline="")
+        writer = csv.DictWriter(output, fieldnames=LEAD_CSV_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        for lead in self.list_leads(**filters):
+            last = lead["last_contact"] or {}
+            writer.writerow(dict(lead, **{f"last_contact_{key}": last.get(key)
+                                         for key in ("status", "channel", "to_address", "subject", "note")}))
+        return output.getvalue().encode("utf-8-sig")
 
     def contact_log(self, lead_id=None, company=None):
         with closing(self._connect()) as db:
@@ -605,7 +873,8 @@ class LeadStore:
                 raise ValueError("lead_id または company を指定してください")
             if not matches:
                 raise KeyError(lead_id or company)
-            return [dict(row) for row in db.execute(f"""
+            status_column = _lead_status_column(db, "contact_logs")
+            return [_contact_result(row, status_column) for row in db.execute(f"""
                 SELECT * FROM contact_logs WHERE lead_id IN ({",".join("?" for _ in matches)})
                 ORDER BY contacted_on, created_at, id
             """, [row["id"] for row in matches])]
@@ -859,9 +1128,11 @@ def _merge_contact_logs(db, keep_id, drop_id):
     """, {"keep": keep_id, "drop": drop_id})
 
 
-def _lead_status_column(db):
-    columns = {row["name"] for row in db.execute("PRAGMA table_info(leads)")}
-    return "contact_status" if "contact_status" in columns else "status"
+def _lead_status_column(db, table="leads"):
+    columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+    for name in ("crm_status", "contact_status", "status"):
+        if name in columns:
+            return name
 
 
 def _company_leads(db, normalized):
@@ -918,15 +1189,20 @@ def _ensure_columns(db):
             if column not in existing:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
-    columns = {row["name"] for row in db.execute("PRAGMA table_info(leads)")}
-    if "contact_status" not in columns:
-        definition = db.execute("SELECT sql FROM sqlite_master WHERE name = 'leads'").fetchone()[0]
-        if "in_discussion" in definition.lower():
-            db.execute("ALTER TABLE leads ADD COLUMN contact_status "
-                       + LEAD_STATUS_COLUMN.format(column="contact_status"))
-            db.execute("""
-                UPDATE leads SET contact_status = CASE status
-                    WHEN 'verified' THEN 'new' WHEN 'in_discussion' THEN 'replied' ELSE status END
+    for table in ("leads", "contact_logs"):
+        current = _lead_status_column(db, table)
+        definition = db.execute("SELECT sql FROM sqlite_master WHERE name = ?", (table,)).fetchone()[0]
+        check = re.search(rf'CHECK\s*\(\s*(?:"{current}"|`{current}`|\[{current}\]|{current})'
+                          r'\s+IN\s*\(([^)]*)\)', definition, re.IGNORECASE)
+        if check and not all(f"'{status}'" in check[1] for status in LEAD_STATUSES):
+            # Preserve constrained columns and copy values to a writable status column.
+            column = "contact_status" if current == "status" else "crm_status"
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} "
+                       + LEAD_STATUS_COLUMN.format(column=column))
+            db.execute(f"""
+                UPDATE {table} SET {column} = CASE {current}
+                    WHEN 'verified' THEN 'new' WHEN 'in_discussion' THEN 'replied'
+                    ELSE COALESCE({current}, 'new') END
             """)
 
 

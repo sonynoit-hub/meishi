@@ -93,7 +93,8 @@ to target a particular page.
 
 If no lead matches the company or URL, Meishi creates a lead marked
 `created_via=status_update` without fetching a page or starting a run.
-Status can be `new`, `contacted`, `replied`, `meeting`, `won`, or `lost`.
+Status can be `new`, `contacted`, `replied`, `meeting`, `won`, `lost`,
+`bounced`, or `unsubscribed`.
 The date uses `YYYY-MM-DD` and the channel can be `email`, `form`, `phone`,
 or another nonempty label. Repeating the same lead, date, channel, and
 recipient returns the original log entry with `deduped: true`. Each call sets
@@ -113,3 +114,48 @@ To expose this operation through an MCP connector, register
 `mcp_tools.UPDATE_LEAD_STATUS_TOOL` and dispatch calls to
 `mcp_tools.update_lead_status(args, base_url, password=...)`. Omit the password
 for a local Meishi instance running without one.
+
+## Cold-email CRM
+
+Use `PATCH /api/leads/{lead_id}` to edit CRM fields. The status endpoint
+accepts the same fields when recording a contact. Omitted fields keep
+their values. Set optional text and date fields to `null` to clear them.
+
+- `email` stores the address with its domain lowercased. Record the public
+  evidence page in `email_source_url`, when you checked it in
+  `email_checked_at`, and a short quote or note in `email_evidence`.
+- `segment` and `batch_id` group outreach. Use a comma-separated string
+  for `tags`.
+- `sequence_step` is a nonnegative integer and defaults to 0.
+  `next_followup_at` takes a `YYYY-MM-DD` date. Enter follow-ups manually
+  for business days 4–5 and 10, up to two follow-ups. Contact history
+  captures the sequence step and batch at the time of each entry.
+- Record replies with `status: replied`, `channel: inbound`, and the
+  reply's `subject` and `note`. Replies, meetings, wins, losses, bounces,
+  and unsubscribes clear the next follow-up date.
+- Set `do_not_contact` to `true` to block outreach for one lead.
+  A bounce or unsubscribe also suppresses the affected email address.
+  A blocked send or scheduling change returns HTTP 409. Replies, wins,
+  losses, bounces, and unsubscribes can still be recorded.
+
+Use `POST /api/suppressions` with `kind` (`email` or `domain`), `value`,
+`reason`, and optional `note` and `source`. Suppression matches email
+addresses case-insensitively and domains include their subdomains.
+`GET /api/suppressions/check?address=hello%40example.com` returns
+`{"suppressed": true}` for a match. `GET /api/suppressions` lists active
+entries. `DELETE /api/suppressions/{id}` soft-removes a row, and
+`GET /api/suppressions?include_removed=true` includes removed rows.
+
+`GET /api/leads` returns lead and company fields, the suppression flag,
+and the latest contact. `GET /api/leads/export.csv` exports the same
+selection as UTF-8 CSV with an Excel-compatible BOM. Both endpoints
+accept `status`, `segment`, `batch_id`, `due_on_or_before` (inclusive),
+`include_suppressed` (defaults to false), `limit`, and `offset`.
+These routes use the app's standard authentication. Write requests
+also require `X-Meishi: 1`.
+
+For MCP, register `LIST_LEADS_TOOL`, `EXPORT_LEADS_CSV_TOOL`,
+`ADD_SUPPRESSION_TOOL`, and `CHECK_SUPPRESSION_TOOL` from `mcp_tools`.
+Dispatch to the corresponding lowercase handler with the same
+`args`, `base_url`, and optional `password` as `update_lead_status`.
+The CSV handler returns decoded CSV text.
