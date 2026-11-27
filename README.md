@@ -79,5 +79,37 @@ python3 scripts/dedup_leads.py --db data/meishi.sqlite3
 
 Add `--apply` to compute and apply a fresh plan in one write transaction.
 Merged leads retain their URLs as aliases, and moved runs keep their original
-source, canonical, and fetch URLs. Apply also retries key backfill and index
+source, canonical, and fetch URLs. Contact history moves to the surviving
+lead, which keeps one entry per date, channel, and recipient. Apply also retries key backfill and index
 creation after the merges.
+
+## Lead status and contact history
+
+Record outreach with `POST /api/leads/status`. Use a lead or run ID in
+`record_id`, a `source_url`, or a `company` name. Matching uses the ID
+first, then the canonical URL and its aliases, then the normalized company name. A company
+with multiple leads resolves to its oldest lead by name. Supply an ID or URL
+to target a particular page.
+
+If no lead matches the company or URL, Meishi creates a lead marked
+`created_via=status_update` without fetching a page or starting a run.
+Status can be `new`, `contacted`, `replied`, `meeting`, `won`, or `lost`.
+The date uses `YYYY-MM-DD` and the channel can be `email`, `form`, `phone`,
+or another nonempty label. Repeating the same lead, date, channel, and
+recipient returns the original log entry with `deduped: true`. Each call sets
+the current status, and `last_contacted_at` records the most recent contact date.
+
+```sh
+curl -u "meishi:$MEISHI_PASSWORD" -H 'X-Meishi: 1' \
+  -H 'Content-Type: application/json' \
+  -d '{"company":"株式会社GOOYA","status":"contacted","date":"2026-11-26","channel":"email","to_address":"hello@example.com","note":"Sent an introduction"}' \
+  http://127.0.0.1:8000/api/leads/status
+```
+
+Read history in ascending date order with `GET /api/leads/{lead_id}/contact-log`
+or use `GET /api/leads/contact-log?company=GOOYA` for all leads at a company.
+
+To expose this operation through an MCP connector, register
+`mcp_tools.UPDATE_LEAD_STATUS_TOOL` and dispatch calls to
+`mcp_tools.update_lead_status(args, base_url, password=...)`. Omit the password
+for a local Meishi instance running without one.

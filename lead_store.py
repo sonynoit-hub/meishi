@@ -34,9 +34,9 @@ import sqlite3
 import unicodedata
 import urllib.error
 import urllib.request
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date as calendar_date, datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
@@ -48,6 +48,8 @@ BROWSER_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 MAX_BODY_BYTES = 3 * 1024 * 1024
+LEAD_STATUSES = ("new", "contacted", "replied", "meeting", "won", "lost")
+LEAD_STATUS_COLUMN = f"TEXT NOT NULL DEFAULT 'new' CHECK ({{column}} IN {LEAD_STATUSES})"
 RUN_STATUSES = ("processing", "review", "added", "fetch_error")
 STATUS_RANK = {"added": 4, "review": 3, "processing": 2, "fetch_error": 1}
 TRANSIENT_HTTP = {408, 429, 500, 502, 503, 504}
@@ -72,7 +74,7 @@ CHARSET_ALIASES = {
     "euc-jp": "euc_jp", "eucjp": "euc_jp", "utf8": "utf-8", "utf-8": "utf-8",
 }
 
-SCHEMA = """
+SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS companies (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -88,8 +90,7 @@ CREATE TABLE IF NOT EXISTS leads (
     canonical_url TEXT NOT NULL,
     signal TEXT NOT NULL,
     lead_type TEXT NOT NULL CHECK (lead_type IN ('buyer', 'partner')),
-    status TEXT NOT NULL DEFAULT 'new'
-        CHECK (status IN ('new','verified','contacted','in_discussion','won','lost')),
+    status {LEAD_STATUS_COLUMN.format(column="status")},
     latest_run_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -105,6 +106,19 @@ CREATE TABLE IF NOT EXISTS runs (
     error TEXT NOT NULL DEFAULT '',
     submitted_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS contact_logs (
+    id TEXT PRIMARY KEY,
+    lead_id TEXT NOT NULL REFERENCES leads(id),
+    status {LEAD_STATUS_COLUMN.format(column="status")},
+    contacted_on TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    to_address TEXT NOT NULL,
+    from_address TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    note TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (lead_id, contacted_on, channel, to_address)
+);
 CREATE TABLE IF NOT EXISTS lead_aliases (
     canonical_url TEXT PRIMARY KEY,
     lead_id TEXT NOT NULL REFERENCES leads(id)
@@ -116,7 +130,9 @@ ADDITIVE_COLUMNS = {
     "leads": {
         "company_id": "TEXT REFERENCES companies(id)",
         "canonical_url": "TEXT",
-        "status": "TEXT NOT NULL DEFAULT 'new'",
+        "status": LEAD_STATUS_COLUMN.format(column="status"),
+        "last_contacted_at": "TEXT",
+        "created_via": "TEXT NOT NULL DEFAULT 'submit' CHECK (created_via IN ('submit', 'status_update'))",
         "latest_run_id": "TEXT",
     },
     "runs": {
@@ -508,6 +524,92 @@ class LeadStore:
             _ensure_columns(db)
             return _backfill_keys(db)
 
+    def update_status(self, record_id=None, company=None, source_url=None, *,
+                      status, date, channel, to_address="", from_address="", subject="", note=""):
+        if status not in LEAD_STATUSES:
+            raise ValueError("status を確認してください")
+        try:
+            if calendar_date.fromisoformat(date).isoformat() != date:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ValueError("date は YYYY-MM-DD 形式です") from None
+        channel = channel.strip().lower()
+        if not channel:
+            raise ValueError("channel を指定してください")
+        to_address = to_address.strip()
+        company = company.strip() if company is not None else None
+        normalized = normalize_company_name(company) if company is not None else None
+        if company is not None and (not normalized or len(company) > 255):
+            raise ValueError("会社名を確認してください")
+        canonical = canonical_url(source_url) if source_url is not None else None
+        if not (record_id or normalized or canonical):
+            raise ValueError("record_id、company、source_url のいずれかを指定してください")
+
+        now = _now()
+        with self._transaction() as db:
+            lead = None
+            if record_id:
+                lead = db.execute("""
+                    SELECT leads.* FROM leads WHERE id = ? OR id = (SELECT lead_id FROM runs WHERE id = ?)
+                    ORDER BY id = ? DESC LIMIT 1
+                """, (record_id, record_id, record_id)).fetchone()
+                if lead is None:
+                    raise KeyError(record_id)
+            else:
+                if canonical:
+                    lead = _lead_for_url(db, canonical)
+                if lead is None and normalized:
+                    matches = _company_leads(db, normalized)
+                    lead = matches[0] if matches else None
+            created = lead is None
+            if created:
+                company = company or urlsplit(canonical).hostname
+                company_id = _upsert_company(db, company, normalized or normalize_company_name(company) or company, now)
+                lead_id = str(uuid4())
+                db.execute("""
+                    INSERT INTO leads (id, company_id, company_name, source_url, canonical_url,
+                        signal, lead_type, status, created_at, updated_at, created_via)
+                    VALUES (?, ?, ?, ?, ?, '', 'partner', 'new', ?, ?, 'status_update')
+                """, (lead_id, company_id, company, canonical or "", canonical or f"urn:meishi:lead:{lead_id}", now, now))
+            else:
+                lead_id, company = lead["id"], lead["company_name"]
+
+            log_id = str(uuid4())
+            key = (lead_id, date, channel, to_address)
+            db.execute("""
+                INSERT INTO contact_logs (id, lead_id, contacted_on, channel, to_address,
+                    status, from_address, subject, note, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (lead_id, contacted_on, channel, to_address) DO NOTHING
+            """, (log_id, *key, status, from_address, subject, note, now))
+            entry = db.execute("""
+                SELECT * FROM contact_logs WHERE lead_id = ? AND contacted_on = ?
+                    AND channel = ? AND to_address = ?
+            """, key).fetchone()
+            status_column = _lead_status_column(db)
+            db.execute(f"""
+                UPDATE leads SET {status_column} = ?, updated_at = ?,
+                    last_contacted_at = MAX(COALESCE(last_contacted_at, ''), ?)
+                WHERE id = ? AND ({status_column} != ? OR last_contacted_at IS NULL OR last_contacted_at < ?)
+            """, (status, now, date, lead_id, status, date))
+            return {"lead_id": lead_id, "company": company, "status": status, "created": created,
+                    "log": dict(entry), "deduped": entry["id"] != log_id}
+
+    def contact_log(self, lead_id=None, company=None):
+        with closing(self._connect()) as db:
+            if lead_id:
+                matches = db.execute("SELECT id FROM leads WHERE id = ?", (lead_id,)).fetchall()
+            elif company is not None and (normalized := normalize_company_name(company)):
+                matches = _company_leads(db, normalized)
+            else:
+                raise ValueError("lead_id または company を指定してください")
+            if not matches:
+                raise KeyError(lead_id or company)
+            return [dict(row) for row in db.execute(f"""
+                SELECT * FROM contact_logs WHERE lead_id IN ({",".join("?" for _ in matches)})
+                ORDER BY contacted_on, created_at, id
+            """, [row["id"] for row in matches])]
+
     def recover_interrupted(self):
         with self._transaction() as db:
             if not _has_lead_tables(db):
@@ -630,6 +732,7 @@ class LeadStore:
                     """, (merge.keep_lead_id, lead_id))
                     db.execute("UPDATE lead_aliases SET lead_id = ? WHERE lead_id = ?",
                                (merge.keep_lead_id, lead_id))
+                    _merge_contact_logs(db, merge.keep_lead_id, lead_id)
                     db.execute("DELETE FROM leads WHERE id = ?", (lead_id,))
                 db.executemany("""
                     INSERT INTO lead_aliases (canonical_url, lead_id) VALUES (?, ?)
@@ -656,14 +759,7 @@ class LeadStore:
         now = _now()
         submitted = {"company": company, "signal": signal, "lead_type": lead_type}
         with self._transaction() as db:
-            lead = db.execute("""
-                SELECT * FROM leads WHERE canonical_url = ? ORDER BY created_at, id LIMIT 1
-            """, (canonical,)).fetchone()
-            if lead is None:
-                lead = db.execute("""
-                    SELECT leads.* FROM lead_aliases JOIN leads ON leads.id = lead_aliases.lead_id
-                    WHERE lead_aliases.canonical_url = ?
-                """, (canonical,)).fetchone()
+            lead = _lead_for_url(db, canonical)
             differing_fields = []
             if lead is None:
                 company_id = _upsert_company(db, company, normalized, now)
@@ -730,6 +826,54 @@ class LeadStore:
             """, (redirect, run["lead_id"], redirect))
 
 
+def _lead_for_url(db, canonical):
+    lead = db.execute("""
+        SELECT * FROM leads WHERE canonical_url = ? ORDER BY created_at, id LIMIT 1
+    """, (canonical,)).fetchone()
+    if lead is not None:
+        return lead
+    return db.execute("""
+        SELECT leads.* FROM lead_aliases JOIN leads ON leads.id = lead_aliases.lead_id
+        WHERE lead_aliases.canonical_url = ?
+    """, (canonical,)).fetchone()
+
+
+def _merge_contact_logs(db, keep_id, drop_id):
+    db.execute("""
+        DELETE FROM contact_logs AS dropped WHERE dropped.lead_id = ? AND EXISTS (
+            SELECT 1 FROM contact_logs AS kept WHERE kept.lead_id = ?
+                AND kept.contacted_on = dropped.contacted_on AND kept.channel = dropped.channel
+                AND kept.to_address = dropped.to_address
+        )
+    """, (drop_id, keep_id))
+    db.execute("UPDATE contact_logs SET lead_id = ? WHERE lead_id = ?", (keep_id, drop_id))
+    status_column = _lead_status_column(db)
+    db.execute(f"""
+        UPDATE leads SET last_contacted_at = (
+            SELECT MAX(contacted_on) FROM contact_logs WHERE lead_id = :keep
+        ), ({status_column}, updated_at) = (
+            SELECT {status_column}, updated_at FROM leads
+            WHERE id = :keep OR (id = :drop AND last_contacted_at IS NOT NULL)
+            ORDER BY last_contacted_at IS NULL, updated_at DESC LIMIT 1
+        ) WHERE id = :keep
+    """, {"keep": keep_id, "drop": drop_id})
+
+
+def _lead_status_column(db):
+    columns = {row["name"] for row in db.execute("PRAGMA table_info(leads)")}
+    return "contact_status" if "contact_status" in columns else "status"
+
+
+def _company_leads(db, normalized):
+    db.create_function("normalize_company_name", 1, normalize_company_name)
+    return db.execute("""
+        SELECT leads.* FROM leads LEFT JOIN companies ON companies.id = leads.company_id
+        WHERE companies.normalized_name = ? OR normalize_company_name(COALESCE(companies.name, '')) = ?
+            OR normalize_company_name(leads.company_name) = ?
+        ORDER BY leads.created_at, leads.id
+    """, (normalized, normalized, normalized)).fetchall()
+
+
 def _insert_run(db, run_id, lead_id, canonical, fetch_url, now, submitted, source_url=None):
     db.execute("""
         INSERT INTO runs (id, lead_id, source_url, canonical_url, fetch_url,
@@ -773,6 +917,17 @@ def _ensure_columns(db):
         for column, definition in definitions.items():
             if column not in existing:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    columns = {row["name"] for row in db.execute("PRAGMA table_info(leads)")}
+    if "contact_status" not in columns:
+        definition = db.execute("SELECT sql FROM sqlite_master WHERE name = 'leads'").fetchone()[0]
+        if "in_discussion" in definition.lower():
+            db.execute("ALTER TABLE leads ADD COLUMN contact_status "
+                       + LEAD_STATUS_COLUMN.format(column="contact_status"))
+            db.execute("""
+                UPDATE leads SET contact_status = CASE status
+                    WHEN 'verified' THEN 'new' WHEN 'in_discussion' THEN 'replied' ELSE status END
+            """)
 
 
 def _lead_key(lead):
