@@ -50,15 +50,14 @@ def main(argv=None):
         return 0
     if args.apply:
         store = LeadStore(args.db)
-        plan = store.plan()
-        print(render_plan(plan))
+        plan = store.apply()
+        print(render_plan(plan, applied=True))
         if plan.note and plan.empty:
             print("\n適用しませんでした。")
             return 0
         if plan.empty:
-            print("\nまとめる重複はないので、適用しませんでした。")
+            print("\nまとめる重複はありません。スキーマと正規化キーを確認しました。")
             return 0
-        store.apply(plan)
         print("\n適用しました。run は残し、重複した lead と company だけをまとめています。")
         return 0
     print(render_plan(LeadStore(args.db).plan(read_only=True)))

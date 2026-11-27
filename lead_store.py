@@ -25,6 +25,7 @@ from __future__ import annotations
 import csv
 import gzip
 import ipaddress
+import json
 import logging
 import posixpath
 import re
@@ -37,7 +38,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
@@ -50,12 +51,11 @@ MAX_BODY_BYTES = 3 * 1024 * 1024
 RUN_STATUSES = ("processing", "review", "added", "fetch_error")
 STATUS_RANK = {"added": 4, "review": 3, "processing": 2, "fetch_error": 1}
 TRANSIENT_HTTP = {408, 429, 500, 502, 503, 504}
-TRACKING_QUERY_KEYS = {
-    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-    "utm_id", "fbclid", "gclid", "gclsrc", "dclid", "yclid", "msclkid",
-    "mc_cid", "mc_eid", "igshid", "_ga", "fb_action_ids", "fb_action_types",
-    "ref", "ref_src",
-}
+TRACKING_QUERY_KEYS = {"gclid", "fbclid", "yclid", "mc_cid", "mc_eid"}
+PERCENT_ESCAPE = re.compile(r"%[0-9a-fA-F]{2}")
+UNRESERVED = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+LATEST_RUN_ORDER = ("submitted_at", "id")
+LATEST_RUN_SQL = ", ".join(f"{column} DESC" for column in LATEST_RUN_ORDER)
 JAPANESE_LEGAL_FORMS = (
     "一般社団法人", "公益社団法人", "一般財団法人", "公益財団法人",
     "社会福祉法人", "医療法人", "学校法人",
@@ -76,7 +76,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS companies (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    normalized_name TEXT NOT NULL UNIQUE,
+    normalized_name TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS leads (
     company_id TEXT REFERENCES companies(id),
     company_name TEXT NOT NULL,
     source_url TEXT NOT NULL,
-    canonical_url TEXT NOT NULL UNIQUE,
+    canonical_url TEXT NOT NULL,
     signal TEXT NOT NULL,
     lead_type TEXT NOT NULL CHECK (lead_type IN ('buyer', 'partner')),
     status TEXT NOT NULL DEFAULT 'new'
@@ -105,9 +105,43 @@ CREATE TABLE IF NOT EXISTS runs (
     error TEXT NOT NULL DEFAULT '',
     submitted_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS runs_lead ON runs(lead_id, submitted_at);
-CREATE INDEX IF NOT EXISTS runs_canonical ON runs(canonical_url, submitted_at);
+CREATE TABLE IF NOT EXISTS lead_aliases (
+    canonical_url TEXT PRIMARY KEY,
+    lead_id TEXT NOT NULL REFERENCES leads(id)
+);
 """
+
+ADDITIVE_COLUMNS = {
+    "companies": {"normalized_name": "TEXT"},
+    "leads": {
+        "company_id": "TEXT REFERENCES companies(id)",
+        "canonical_url": "TEXT",
+        "status": "TEXT NOT NULL DEFAULT 'new'",
+        "latest_run_id": "TEXT",
+    },
+    "runs": {
+        "canonical_url": "TEXT",
+        "fetch_url": "TEXT",
+        "error": "TEXT NOT NULL DEFAULT ''",
+        "submitted_company": "TEXT",
+        "submitted_signal": "TEXT",
+        "submitted_lead_type": "TEXT",
+        "resubmissions": "TEXT NOT NULL DEFAULT '[]'",
+        "redirect_canonical_url": "TEXT",
+        "original_source_url": "TEXT",
+        "original_canonical_url": "TEXT",
+        "original_fetch_url": "TEXT",
+    },
+}
+
+
+def _normalize_escapes(value):
+    def replace(match):
+        escape = match[0]
+        character = chr(int(escape[1:], 16))
+        return character if character in UNRESERVED else escape.upper()
+
+    return PERCENT_ESCAPE.sub(replace, value)
 
 
 class FetchOutcome:
@@ -152,25 +186,20 @@ def canonical_url(value):
         port = parts.port
     except ValueError as error:
         raise ValueError("URLを確認してください") from error
-    if port in (None, 80, 443):
-        port_text = ""
-    else:
-        port_text = f":{port}"
+    scheme = parts.scheme.lower()
+    default_port = 80 if scheme == "http" else 443
+    port_text = "" if port in (None, default_port) else f":{port}"
     netloc = f"[{host}]{port_text}" if ":" in host else f"{host}{port_text}"
-    path = unquote(parts.path or "")
-    if path in {"", "/"}:
-        path = ""
-    else:
-        if not path.startswith("/"):
-            path = "/" + path
-        path = posixpath.normpath(path)
-        path = "" if path == "/" else quote(path, safe="/%:@")
-    query_pairs = [
-        (key, item) for key, item in parse_qsl(parts.query, keep_blank_values=False)
-        if key.lower() not in TRACKING_QUERY_KEYS
-    ]
-    query_pairs.sort()
-    canonical = urlunsplit(("https", netloc, path, urlencode(query_pairs, doseq=True), ""))
+    path = posixpath.normpath(_normalize_escapes(parts.path)).rstrip("/") if parts.path else ""
+    query = []
+    for parameter in parts.query.split("&"):
+        parameter = _normalize_escapes(parameter)
+        key = parameter.partition("=")[0].lower()
+        if key not in TRACKING_QUERY_KEYS and not key.startswith("utm_"):
+            query.append(parameter)
+    # Keep http:443 explicit so a canonical key can be canonicalized again.
+    canonical_scheme = "http" if scheme == "http" and port == 443 else "https"
+    canonical = urlunsplit((canonical_scheme, netloc, path, "&".join(query), ""))
     if len(canonical) > 2048:
         raise ValueError("URLは1〜2048文字です")
     return canonical
@@ -418,8 +447,9 @@ class UrlMerge:
     keep_lead_id: str
     drop_lead_ids: list[str]
     move_run_ids: list[str]
-    latest_run_id: str
+    latest_run_id: str | None
     reason: str
+    aliases: list[str]
 
 
 @dataclass
@@ -474,12 +504,9 @@ class LeadStore:
 
     def ensure_schema(self):
         self.db_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        connection = self._connect()
-        try:
-            connection.executescript(SCHEMA)
-            connection.commit()
-        finally:
-            connection.close()
+        with self._transaction() as db:
+            _ensure_columns(db)
+            return _backfill_keys(db)
 
     def recover_interrupted(self):
         with self._transaction() as db:
@@ -524,6 +551,7 @@ class LeadStore:
             "reused": not reserved["fetch"],
             "status": status,
             "canonical_url": canonical,
+            "differing_fields": reserved["differing_fields"],
         }
 
     def retry(self, run_id):
@@ -537,15 +565,12 @@ class LeadStore:
             lead = db.execute("SELECT * FROM leads WHERE id = ?", (run["lead_id"],)).fetchone()
             new_id = str(uuid4())
             now = _now()
-            db.execute("""
-                INSERT INTO runs (id, lead_id, source_url, canonical_url, fetch_url,
-                    processing_status, error, submitted_at)
-                VALUES (?, ?, ?, ?, ?, 'processing', '', ?)
-            """, (new_id, lead["id"], lead["canonical_url"], lead["canonical_url"], run["fetch_url"], now))
-            db.execute(
-                "UPDATE leads SET latest_run_id = ?, updated_at = ? WHERE id = ?",
-                (new_id, now, lead["id"]),
+            _insert_run(
+                db, new_id, lead["id"], run["canonical_url"], run["fetch_url"], now,
+                (run["submitted_company"], run["submitted_signal"], run["submitted_lead_type"]),
+                source_url=run["source_url"],
             )
+            _update_latest_run(db, lead["id"], now)
             fetch_url = run["fetch_url"]
             lead_id = lead["id"]
             company_id = lead["company_id"]
@@ -574,31 +599,43 @@ class LeadStore:
 
     def plan(self, read_only=False):
         if read_only:
-            connection = sqlite3.connect(f"file:{self.db_path.resolve().as_posix()}?mode=ro", uri=True)
+            connection = sqlite3.connect(f"{self.db_path.resolve().as_uri()}?mode=ro", uri=True)
             connection.row_factory = sqlite3.Row
         else:
             connection = self._connect()
         try:
+            connection.execute("BEGIN")
             if not _has_lead_tables(connection):
                 return DatabasePlan(note="このデータベースにリードの表はありません。")
             return _build_plan(connection)
         finally:
             connection.close()
 
-    def apply(self, plan):
-        if plan.empty:
-            return
-        now = _now()
+    def apply(self, plan=None):
+        # A previously displayed plan may be stale by the time we acquire the lock.
         with self._transaction() as db:
+            if not _has_lead_tables(db):
+                return DatabasePlan(note="このデータベースにリードの表はありません。")
+            _ensure_columns(db)
+            plan = _build_plan(db)
+            now = _now()
             for merge in plan.url_merges:
                 for lead_id in merge.drop_lead_ids:
-                    db.execute("UPDATE runs SET lead_id = ? WHERE lead_id = ?", (merge.keep_lead_id, lead_id))
+                    db.execute("""
+                        UPDATE runs SET lead_id = ?,
+                            original_source_url = COALESCE(original_source_url, source_url),
+                            original_canonical_url = COALESCE(original_canonical_url, canonical_url),
+                            original_fetch_url = COALESCE(original_fetch_url, fetch_url)
+                        WHERE lead_id = ?
+                    """, (merge.keep_lead_id, lead_id))
+                    db.execute("UPDATE lead_aliases SET lead_id = ? WHERE lead_id = ?",
+                               (merge.keep_lead_id, lead_id))
                     db.execute("DELETE FROM leads WHERE id = ?", (lead_id,))
-                db.execute(
-                    """UPDATE leads SET source_url = ?, canonical_url = ?, latest_run_id = ?, updated_at = ?
-                       WHERE id = ?""",
-                    (merge.canonical_url, merge.canonical_url, merge.latest_run_id, now, merge.keep_lead_id),
-                )
+                db.executemany("""
+                    INSERT INTO lead_aliases (canonical_url, lead_id) VALUES (?, ?)
+                    ON CONFLICT(canonical_url) DO NOTHING
+                """, [(key, merge.keep_lead_id) for key in merge.aliases])
+                _update_latest_run(db, merge.keep_lead_id, now)
             for merge in plan.company_merges:
                 for company_id in merge.drop_company_ids:
                     db.execute(
@@ -606,55 +643,59 @@ class LeadStore:
                         (merge.keep_company_id, now, company_id),
                     )
                     db.execute("DELETE FROM companies WHERE id = ?", (company_id,))
-                db.execute(
-                    "UPDATE companies SET normalized_name = ?, updated_at = ? WHERE id = ?",
-                    (merge.normalized_name, now, merge.keep_company_id),
-                )
             for company_id in plan.empty_company_ids:
                 db.execute(
                     """DELETE FROM companies WHERE id = ?
                        AND NOT EXISTS (SELECT 1 FROM leads WHERE company_id = companies.id)""",
                     (company_id,),
                 )
+            _backfill_keys(db)
+            return plan
 
     def _reserve(self, company, canonical, fetch_url, normalized, signal, lead_type):
         now = _now()
+        submitted = {"company": company, "signal": signal, "lead_type": lead_type}
         with self._transaction() as db:
-            lead = db.execute("SELECT * FROM leads WHERE canonical_url = ?", (canonical,)).fetchone()
-            if lead is not None:
-                latest = _latest_run(db, lead["id"])
-                if latest is not None and latest["processing_status"] != "fetch_error":
-                    db.execute(
-                        "UPDATE leads SET signal = ?, lead_type = ?, updated_at = ? WHERE id = ?",
-                        (signal, lead_type, now, lead["id"]),
-                    )
-                    return {
-                        "fetch": False, "run_id": latest["id"], "lead_id": lead["id"],
-                        "company_id": lead["company_id"], "status": latest["processing_status"],
-                    }
+            lead = db.execute("""
+                SELECT * FROM leads WHERE canonical_url = ? ORDER BY created_at, id LIMIT 1
+            """, (canonical,)).fetchone()
+            if lead is None:
+                lead = db.execute("""
+                    SELECT leads.* FROM lead_aliases JOIN leads ON leads.id = lead_aliases.lead_id
+                    WHERE lead_aliases.canonical_url = ?
+                """, (canonical,)).fetchone()
+            differing_fields = []
+            if lead is None:
+                company_id = _upsert_company(db, company, normalized, now)
+                lead_id = str(uuid4())
+                db.execute("""
+                    INSERT INTO leads (id, company_id, company_name, source_url, canonical_url,
+                        signal, lead_type, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)
+                """, (lead_id, company_id, company, fetch_url, canonical, signal, lead_type, now, now))
+                latest = None
+            else:
+                lead_id, company_id = lead["id"], lead["company_id"]
+                original = {"company": lead["company_name"], "signal": lead["signal"],
+                            "lead_type": lead["lead_type"]}
+                differing_fields = [key for key in submitted if submitted[key] != original[key]]
+                latest = _latest_run(db, lead_id)
+
+            fetch = latest is None or latest["processing_status"] == "fetch_error"
+            if fetch:
                 run_id = str(uuid4())
-                _insert_run(db, run_id, lead["id"], canonical, fetch_url, now)
-                db.execute(
-                    """UPDATE leads SET latest_run_id = ?, signal = ?, lead_type = ?, updated_at = ?
-                       WHERE id = ?""",
-                    (run_id, signal, lead_type, now, lead["id"]),
-                )
-                return {
-                    "fetch": True, "run_id": run_id, "lead_id": lead["id"],
-                    "company_id": lead["company_id"], "status": "processing",
-                }
-            company_id = _upsert_company(db, company, normalized, now)
-            lead_id = str(uuid4())
-            run_id = str(uuid4())
-            db.execute("""
-                INSERT INTO leads (id, company_id, company_name, source_url, canonical_url,
-                    signal, lead_type, status, latest_run_id, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)
-            """, (lead_id, company_id, company, canonical, canonical, signal, lead_type, run_id, now, now))
-            _insert_run(db, run_id, lead_id, canonical, fetch_url, now)
+                _insert_run(db, run_id, lead_id, canonical, fetch_url, now, (company, signal, lead_type))
+                status = "processing"
+            else:
+                run_id, status = latest["id"], latest["processing_status"]
+                history = json.loads(latest["resubmissions"])
+                history.append({**submitted, "submitted_at": now, "source_url": fetch_url})
+                db.execute("UPDATE runs SET resubmissions = ? WHERE id = ?",
+                           (json.dumps(history, ensure_ascii=False), run_id))
+            _update_latest_run(db, lead_id, now)
             return {
-                "fetch": True, "run_id": run_id, "lead_id": lead_id,
-                "company_id": company_id, "status": "processing",
+                "fetch": fetch, "run_id": run_id, "lead_id": lead_id,
+                "company_id": company_id, "status": status, "differing_fields": differing_fields,
             }
 
     def _run_fetch(self, url):
@@ -667,25 +708,39 @@ class LeadStore:
     def _complete(self, run_id, outcome):
         status = "review" if outcome.ok else "fetch_error"
         error = "" if outcome.ok else (outcome.error or "ページを取得できませんでした。")[:300]
+        redirect = None
+        if outcome.ok and outcome.final_url:
+            try:
+                redirect = canonical_url(outcome.final_url)
+            except ValueError:
+                pass
         with self._transaction() as db:
-            db.execute(
-                """UPDATE runs SET processing_status = ?, error = ?
-                   WHERE id = ? AND processing_status = 'processing'""",
-                (status, error, run_id),
-            )
+            run = db.execute("""
+                UPDATE runs SET processing_status = ?, error = ?
+                WHERE id = ? AND processing_status = 'processing'
+                RETURNING lead_id, canonical_url
+            """, (status, error, run_id)).fetchone()
+            if run is None or not redirect or redirect == run["canonical_url"]:
+                return
+            db.execute("UPDATE runs SET redirect_canonical_url = ? WHERE id = ?", (redirect, run_id))
+            db.execute("""
+                INSERT INTO lead_aliases (canonical_url, lead_id)
+                SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM leads WHERE canonical_url = ?)
+                ON CONFLICT(canonical_url) DO NOTHING
+            """, (redirect, run["lead_id"], redirect))
 
 
-def _insert_run(db, run_id, lead_id, canonical, fetch_url, now):
+def _insert_run(db, run_id, lead_id, canonical, fetch_url, now, submitted, source_url=None):
     db.execute("""
         INSERT INTO runs (id, lead_id, source_url, canonical_url, fetch_url,
-            processing_status, error, submitted_at)
-        VALUES (?, ?, ?, ?, ?, 'processing', '', ?)
-    """, (run_id, lead_id, canonical, canonical, fetch_url, now))
+            processing_status, submitted_at, submitted_company, submitted_signal, submitted_lead_type)
+        VALUES (?, ?, ?, ?, ?, 'processing', ?, ?, ?, ?)
+    """, (run_id, lead_id, source_url or fetch_url, canonical, fetch_url, now, *submitted))
 
 
 def _upsert_company(db, display_name, normalized, now):
     row = db.execute(
-        "SELECT id FROM companies WHERE normalized_name = ?", (normalized,),
+        "SELECT id FROM companies WHERE normalized_name = ? ORDER BY created_at, id LIMIT 1", (normalized,),
     ).fetchone()
     if row is not None:
         db.execute("UPDATE companies SET updated_at = ? WHERE id = ?", (now, row["id"]))
@@ -699,11 +754,90 @@ def _upsert_company(db, display_name, normalized, now):
 
 
 def _latest_run(db, lead_id):
-    return db.execute(
-        """SELECT * FROM runs WHERE lead_id = ?
-           ORDER BY submitted_at DESC, rowid DESC LIMIT 1""",
-        (lead_id,),
-    ).fetchone()
+    return db.execute(f"SELECT * FROM runs WHERE lead_id = ? ORDER BY {LATEST_RUN_SQL} LIMIT 1",
+                      (lead_id,)).fetchone()
+
+
+def _update_latest_run(db, lead_id, now):
+    latest = _latest_run(db, lead_id)
+    db.execute("UPDATE leads SET latest_run_id = ?, updated_at = ? WHERE id = ?",
+               (latest["id"] if latest else None, now, lead_id))
+
+
+def _ensure_columns(db):
+    for statement in SCHEMA.split(";"):
+        if statement.strip():
+            db.execute(statement)
+    for table, definitions in ADDITIVE_COLUMNS.items():
+        existing = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+        for column, definition in definitions.items():
+            if column not in existing:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _lead_key(lead):
+    source = lead["source_url"] or lead.get("canonical_url")
+    if not source:
+        return None
+    try:
+        return canonical_url(source)
+    except ValueError:
+        return lead.get("canonical_url") or source
+
+
+def _lead_keys(leads, runs):
+    by_id = {lead["id"]: lead for lead in leads}
+    keys = {lead_id: _lead_key(lead) for lead_id, lead in by_id.items()}
+    # The previous store saved the canonical key as the lead and run source.
+    # Only the initial run's fetch URL can restore the original spelling.
+    for run in runs:
+        lead = by_id.get(run["lead_id"])
+        if (lead and run["submitted_at"] == lead["created_at"]
+                and run["source_url"] == lead["source_url"] and run.get("fetch_url")):
+            keys[lead["id"]] = _lead_key({**lead, "source_url": run["fetch_url"]})
+    return keys
+
+
+def _backfill_keys(db):
+    warnings = []
+    lead_keys = _lead_keys(
+        [dict(row) for row in db.execute("SELECT * FROM leads")],
+        (dict(row) for row in db.execute("SELECT * FROM runs ORDER BY id")),
+    )
+    for table, column, key_for_row in (
+        ("companies", "normalized_name", lambda row: normalize_company_name(row["name"]) or None),
+        ("leads", "canonical_url", lambda row: lead_keys[row["id"]]),
+    ):
+        blocked = False
+        for row in db.execute(f"SELECT * FROM {table} ORDER BY id").fetchall():
+            key = key_for_row(dict(row))
+            if key is None or key == row[column]:
+                continue
+            try:
+                db.execute(f"UPDATE {table} SET {column} = ? WHERE id = ?", (key, row["id"]))
+            except sqlite3.IntegrityError:
+                blocked = True
+        try:
+            db.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS {table}_{column}_unique ON {table}({column})")
+        except sqlite3.IntegrityError:
+            blocked = True
+        if blocked:
+            warning = f"Duplicate {table}.{column} keys need cleanup before migration can finish"
+            warnings.append(warning)
+            logger.warning(warning)
+    db.execute("UPDATE runs SET fetch_url = source_url WHERE fetch_url IS NULL OR fetch_url = ''")
+    for row in db.execute("SELECT id, source_url, fetch_url, canonical_url FROM runs").fetchall():
+        key = _lead_key({"source_url": row["fetch_url"], "canonical_url": row["canonical_url"]})
+        if key != row["canonical_url"]:
+            db.execute("UPDATE runs SET canonical_url = ? WHERE id = ?", (key, row["id"]))
+    db.execute("CREATE INDEX IF NOT EXISTS runs_lead ON runs(lead_id, submitted_at)")
+    db.execute("CREATE INDEX IF NOT EXISTS runs_canonical ON runs(canonical_url, submitted_at)")
+    db.execute(f"""
+        UPDATE leads SET latest_run_id = (
+            SELECT id FROM runs WHERE runs.lead_id = leads.id ORDER BY {LATEST_RUN_SQL} LIMIT 1
+        )
+    """)
+    return warnings
 
 
 def _has_lead_tables(db):
@@ -712,56 +846,77 @@ def _has_lead_tables(db):
     return {"companies", "leads", "runs"} <= names
 
 
-def _best_run(runs):
-    return max(runs, key=lambda run: (
-        STATUS_RANK.get(run["processing_status"], 0), run["submitted_at"], run["rowid"],
-    ))
-
-
 def _build_plan(db):
     leads = [dict(row) for row in db.execute("SELECT * FROM leads ORDER BY created_at, id")]
     companies = [dict(row) for row in db.execute("SELECT * FROM companies ORDER BY created_at, id")]
-    runs = [dict(row) for row in db.execute("SELECT rowid AS rowid, * FROM runs")]
+    runs = [dict(row) for row in db.execute("SELECT * FROM runs")]
     runs_by_lead = {}
     for run in runs:
         runs_by_lead.setdefault(run["lead_id"], []).append(run)
-    groups = {}
-    for lead in leads:
-        try:
-            key = canonical_url(lead["source_url"])
-        except ValueError:
-            key = lead["canonical_url"]
-        groups.setdefault(key, []).append(lead)
+    lead_keys = _lead_keys(leads, sorted(runs, key=lambda run: run["id"]))
+    keys_by_lead = {lead_id: {key} if key else set() for lead_id, key in lead_keys.items()}
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name = 'lead_aliases'").fetchone():
+        for alias in db.execute("SELECT canonical_url, lead_id FROM lead_aliases"):
+            if alias["lead_id"] in keys_by_lead:
+                keys_by_lead[alias["lead_id"]].add(alias["canonical_url"])
+    for run in runs:
+        redirect = run.get("redirect_canonical_url")
+        if redirect and run["lead_id"] in keys_by_lead:
+            keys_by_lead[run["lead_id"]].add(redirect)
 
+    leads_by_key = {}
+    for lead_id, keys in keys_by_lead.items():
+        for key in keys:
+            leads_by_key.setdefault(key, []).append(lead_id)
+
+    leads_by_id = {lead["id"]: lead for lead in leads}
+    visited = set()
     url_merges = []
     dropped = set()
-    for key in sorted(groups):
-        grouped = groups[key]
+    for lead_id in leads_by_id:
+        if lead_id in visited:
+            continue
+        pending = [lead_id]
+        grouped = []
+        shared_keys = set()
+        while pending:
+            member = pending.pop()
+            if member in visited:
+                continue
+            visited.add(member)
+            grouped.append(leads_by_id[member])
+            for key in keys_by_lead[member] - shared_keys:
+                shared_keys.add(key)
+                pending.extend(leads_by_key[key])
         if len(grouped) < 2:
             continue
+
         def rank(lead):
             lead_runs = runs_by_lead.get(lead["id"], [])
-            best = STATUS_RANK.get(_best_run(lead_runs)["processing_status"], 0) if lead_runs else 0
+            best = max((STATUS_RANK.get(run["processing_status"], 0) for run in lead_runs), default=0)
             return (-best, lead["created_at"], lead["id"])
+
         keeper = min(grouped, key=rank)
-        drop_ids = [lead["id"] for lead in grouped if lead["id"] != keeper["id"]]
-        moved = [run["id"] for lead_id in drop_ids for run in runs_by_lead.get(lead_id, [])]
+        key = lead_keys[keeper["id"]] or min(shared_keys)
+        drop_ids = sorted(lead["id"] for lead in grouped if lead["id"] != keeper["id"])
+        moved = sorted(run["id"] for member in drop_ids for run in runs_by_lead.get(member, []))
         combined = [run for lead in grouped for run in runs_by_lead.get(lead["id"], [])]
-        latest = _best_run(combined)["id"] if combined else keeper.get("latest_run_id")
-        best_status = _best_run(combined)["processing_status"] if combined else "なし"
+        latest = max(combined, key=lambda run: tuple(run[column] for column in LATEST_RUN_ORDER), default=None)
         url_merges.append(UrlMerge(
             canonical_url=key,
             keep_lead_id=keeper["id"],
             drop_lead_ids=drop_ids,
             move_run_ids=moved,
-            latest_run_id=latest,
-            reason=f"同じ正規化URL。残すリードは状態 {best_status} の最も古いレコード。",
+            latest_run_id=latest["id"] if latest else None,
+            reason="正規化URLまたはリダイレクト先が一致しています。",
+            aliases=sorted(shared_keys - {key}),
         ))
         dropped.update(drop_ids)
+    url_merges.sort(key=lambda merge: merge.canonical_url)
 
     surviving_company_counts = {}
     for lead in leads:
-        if lead["id"] in dropped or not lead["company_id"]:
+        if lead["id"] in dropped or not lead.get("company_id"):
             continue
         surviving_company_counts[lead["company_id"]] = surviving_company_counts.get(lead["company_id"], 0) + 1
     by_name = {}
@@ -782,7 +937,7 @@ def _build_plan(db):
         drop_ids = [company["id"] for company in grouped if company["id"] != keeper["id"]]
         repoint = [
             lead["id"] for lead in leads
-            if lead["id"] not in dropped and lead["company_id"] in drop_ids
+            if lead["id"] not in dropped and lead.get("company_id") in drop_ids
         ]
         company_merges.append(CompanyMerge(
             normalized_name=key, keep_company_id=keeper["id"], keep_name=keeper["name"],
@@ -794,7 +949,7 @@ def _build_plan(db):
     for company in companies:
         if company["id"] in merged_away:
             continue
-        had_leads = any(lead["company_id"] == company["id"] for lead in leads)
+        had_leads = any(lead.get("company_id") == company["id"] for lead in leads)
         survives = surviving_company_counts.get(company["id"], 0) > 0
         if had_leads and not survives:
             emptied.append(company["id"])
@@ -802,8 +957,9 @@ def _build_plan(db):
     return DatabasePlan(url_merges=url_merges, company_merges=company_merges, empty_company_ids=emptied)
 
 
-def render_plan(plan):
-    lines = ["Meishi lead dedup review", plan.note or "既存データは変更しません。"]
+def render_plan(plan, *, applied=False):
+    heading = "適用した整理内容です。" if applied else "既存データは変更しません。"
+    lines = ["Meishi lead dedup review", plan.note or heading]
     lines.append(f"同じページとしてまとめるリード: {len(plan.url_merges)}")
     for merge in plan.url_merges:
         lines.append(f"- {merge.canonical_url}")
@@ -811,6 +967,8 @@ def render_plan(plan):
         lines.append(f"  まとめる lead: {', '.join(merge.drop_lead_ids) or 'なし'}")
         lines.append(f"  移動する run: {', '.join(merge.move_run_ids) or 'なし'}")
         lines.append(f"  {merge.reason}")
+        if merge.aliases:
+            lines.append(f"  別名URL: {', '.join(merge.aliases)}")
     lines.append(f"同じ組織としてまとめる会社: {len(plan.company_merges)}")
     for merge in plan.company_merges:
         lines.append(f"- {merge.normalized_name}: 残す {merge.keep_name} ({merge.keep_company_id})")
