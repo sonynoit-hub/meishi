@@ -7,7 +7,7 @@ import sqlite3
 import threading
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, field_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from codex_reader import ReadError, recognize
+from lead_store import LeadStore
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("MEISHI_DB", ROOT / "data" / "meishi.sqlite3"))
@@ -92,6 +93,8 @@ def initialize():
                 read_error = '読み取りが中断されました。もう一度読み取れます。'
             WHERE status = 'processing'
         """)
+    LeadStore(DB_PATH).ensure_schema()
+    LeadStore(DB_PATH).recover_interrupted()
 
 
 def process_queue(stop, wake):
@@ -322,6 +325,45 @@ def reread(card_id: UUID):
         card = get_card(db, card_id)
     app.state.wake.set()
     return card
+
+
+class LeadIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    company: str
+    source_url: str
+    signal: str
+    lead_type: Literal["buyer", "partner"]
+
+    @field_validator("company", "source_url", "signal")
+    @classmethod
+    def trim(cls, value):
+        return value.strip()
+
+
+@app.post("/api/leads", dependencies=write)
+def submit_lead(body: LeadIn):
+    try:
+        return LeadStore(DB_PATH).submit(body.company, body.source_url, body.signal, body.lead_type)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+
+
+@app.get("/api/leads/runs/{run_id}")
+def lead_run_status(run_id: UUID):
+    try:
+        return LeadStore(DB_PATH).status(str(run_id))
+    except KeyError:
+        raise HTTPException(404, "処理が見つかりません") from None
+
+
+@app.post("/api/leads/runs/{run_id}/retry", dependencies=write)
+def retry_lead_run(run_id: UUID):
+    try:
+        return LeadStore(DB_PATH).retry(str(run_id))
+    except KeyError:
+        raise HTTPException(404, "処理が見つかりません") from None
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
 
 
 if __name__ == "__main__":
